@@ -4,7 +4,6 @@ shader_type sky;
 // mandatory srgb_to_linear(COLOR) cancels it -> correct linear HDR radiance into tonemapping.
 uniform sampler2D panorama : filter_linear, hint_default_black;
 uniform float exposure : hint_range(0.0, 16.0) = 1.0;
-const float PI = 3.14159265359;
 void sky() {
 	vec3 d = normalize(EYEDIR);
 	vec2 uv = vec2(atan(d.x, d.z) / (2.0 * PI) + 0.5, acos(clamp(d.y, -1.0, 1.0)) / PI);
