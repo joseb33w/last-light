@@ -1,264 +1,269 @@
 class_name Enemy
 extends CharacterBody3D
-## A skeleton that rises from the dark, lurches toward the camp, and attacks the keeper.
-## Slower and easier to kill within the firelight. Juicy hit-flash + blood on every strike.
+## Wave enemies: melee infected/alien, ranged cyber enforcer, and the reaver boss.
+## Chases the player, attacks (melee lunge or plasma bolt), flashes on hit, dies for score.
 
-signal died(at: Vector3)
+signal died(score_value: int, at: Vector3)
 
-const GRAVITY := 22.0
+const KINDS := {
+    "infected": {"hp": 70.0, "speed": 4.0, "dmg": 9.0, "score": 100, "scale": 1.0,
+        "tint": Color(0.50, 0.62, 0.40), "ranged": false, "range": 1.9, "cd": 1.2, "boss": false},
+    "alien": {"hp": 55.0, "speed": 5.3, "dmg": 11.0, "score": 140, "scale": 1.0,
+        "tint": Color(0.56, 0.44, 0.72), "ranged": false, "range": 1.9, "cd": 1.0, "boss": false},
+    "cyber": {"hp": 115.0, "speed": 3.3, "dmg": 13.0, "score": 200, "scale": 1.05,
+        "tint": Color(0.58, 0.66, 0.72), "ranged": true, "range": 13.0, "cd": 1.7, "boss": false},
+    "reaver": {"hp": 1700.0, "speed": 3.6, "dmg": 30.0, "score": 3000, "scale": 1.9,
+        "tint": Color(0.74, 0.30, 0.28), "ranged": true, "range": 3.4, "cd": 1.4, "boss": true},
+}
 
-# set by the spawner BEFORE add_child:
-var variant := "minion"
-var fire_ref: Campfire
-var max_health := 60.0
-var damage := 12.0
-var base_speed := 2.3
-var tint := Color(1, 1, 1)
+var kind := "infected"
+var target: Node3D = null
+var speed_mul := 1.0
 
-enum St { SPAWNING, CHASE, ATTACK, HURT, DYING }
+var hp := 70.0
+var max_hp := 70.0
+var dmg := 9.0
+var score_value := 100
+var move_speed := 4.0
+var is_ranged := false
+var is_boss := false
+var atk_range := 1.9
+var atk_cd := 1.2
 
-var health := 60.0
-var _state: int = St.SPAWNING
-var _model: Node3D
-var _ap: AnimationPlayer
-var _meshes: Array[MeshInstance3D] = []
-var _spawn_t := 0.0
-var _atk_cd := 0.0
-var _atk_t := 0.0
-var _did_strike := false
-var _hurt_t := 0.0
-var _burn_t := 0.0
-var _knock := Vector3.ZERO
-var _player: Player
+var _rig: MeshyCharacterRig
+var _mats: Array[StandardMaterial3D] = []
+var _dead := false
+var _atk_timer := 0.0
+var _windup := -1.0
+var _boss_special := 4.0
+var _rng := RandomNumberGenerator.new()
+
+func setup(p_kind: String) -> void:
+    kind = p_kind
+    var d: Dictionary = KINDS[p_kind]
+    max_hp = float(d["hp"])
+    hp = max_hp
+    move_speed = float(d["speed"])
+    dmg = float(d["dmg"])
+    score_value = int(d["score"])
+    is_ranged = bool(d["ranged"])
+    is_boss = bool(d["boss"])
+    atk_range = float(d["range"])
+    atk_cd = float(d["cd"])
 
 func _ready() -> void:
-	collision_layer = 4
-	collision_mask = 1
-	add_to_group("enemies")
+    _rng.randomize()
+    add_to_group("enemy")
+    collision_layer = 4         # layer 3 = enemies (player hitscan mask hits this)
+    collision_mask = 1          # collide with world only
+    var d: Dictionary = KINDS[kind]
+    var sc: float = float(d["scale"])
+    var cap := CapsuleShape3D.new()
+    cap.radius = 0.45 * sc
+    cap.height = 1.8 * sc
+    var cs := CollisionShape3D.new()
+    cs.shape = cap
+    cs.position.y = 0.9 * sc
+    add_child(cs)
+    _build_rig(sc, d["tint"])
 
-	var col := CollisionShape3D.new()
-	var cap := CapsuleShape3D.new()
-	cap.radius = 0.38
-	cap.height = 1.6
-	col.shape = cap
-	col.position = Vector3(0, 0.85, 0)
-	add_child(col)
+func _build_rig(sc: float, tint: Color) -> void:
+    _rig = MeshyCharacterRig.new()
+    _rig.scale = Vector3(sc, sc, sc)
+    add_child(_rig)
+    var ch := (load("res://models/%s.glb" % kind) as PackedScene).instantiate() as Node3D
+    if kind == "cyber":
+        var wp := (load("res://models/armcannon.glb") as PackedScene).instantiate() as Node3D
+        _rig.setup(ch, wp, MeshyCharacterRig.ARMCANNON)
+    else:
+        _rig.setup(ch)
+    _rig.play("idle")
+    _cache_mats(tint)
 
-	health = max_health
-	var path := "res://models/enemies/kk_Skeleton_Warrior.glb" if variant == "warrior" else "res://models/enemies/kk_Skeleton_Minion.glb"
-	_model = load(path).instantiate()
-	add_child(_model)
-	_model.position.y = -1.05    # rise from the ground on spawn
-	if tint != Color(1, 1, 1):
-		_apply_tint(tint)
-	_ap = _model.find_child("AnimationPlayer", true, false)
-	for m: MeshInstance3D in _model.find_children("*", "MeshInstance3D", true, false):
-		_meshes.append(m)
-	_loopify(["Skeletons_Walking", "Skeletons_Idle"])
-	if _ap != null:
-		_ap.animation_finished.connect(_on_anim_finished)
-		if _ap.has_animation("Skeletons_Spawn_Ground"):
-			_ap.play("Skeletons_Spawn_Ground")
-		elif _ap.has_animation("Skeletons_Awaken_Standing"):
-			_ap.play("Skeletons_Awaken_Standing")
-
-	var ps := get_tree().get_first_node_in_group("player")
-	if ps is Player:
-		_player = ps
-
-func _apply_tint(c: Color) -> void:
-	for m: MeshInstance3D in _model.find_children("*", "MeshInstance3D", true, false):
-		if m.mesh == null:
-			continue
-		for s in range(maxi(1, m.mesh.get_surface_count())):
-			var base := m.get_active_material(s)
-			var mat := (base.duplicate() if base != null else StandardMaterial3D.new()) as StandardMaterial3D
-			if mat == null:
-				continue
-			mat.albedo_color = c
-			m.set_surface_override_material(s, mat)
-
-func _loopify(names: Array) -> void:
-	if _ap == null:
-		return
-	for n: String in names:
-		if _ap.has_animation(n):
-			_ap.get_animation(n).loop_mode = Animation.LOOP_LINEAR
-
-func is_dying() -> bool:
-	return _state == St.DYING
-
-func take_hit(from_pos: Vector3, dmg: float) -> void:
-	if _state == St.DYING:
-		return
-	var near_fire := _near_fire()
-	var mult := 1.6 if near_fire else 1.0
-	health -= dmg * mult
-	var hit_pos := global_position + Vector3(0, 1.1, 0)
-	Impact.burst(get_tree().current_scene, hit_pos, Color(0.7, 0.05, 0.06), 16, 4.5, 0.5)
-	Impact.burst(get_tree().current_scene, hit_pos, Color(1.0, 0.9, 0.7), 8, 5.5, 0.3)
-	_flash()
-	var dir := global_position - from_pos
-	dir.y = 0.0
-	if dir.length() > 0.05:
-		_knock = dir.normalized() * 5.0
-	if health <= 0.0:
-		_die()
-		return
-	if _state != St.ATTACK:
-		_state = St.HURT
-		_hurt_t = 0.0
-		if _ap != null and _ap.has_animation("Hit_A"):
-			_ap.play("Hit_A", 0.05)
-
-func _flash() -> void:
-	for m: MeshInstance3D in _meshes:
-		var fm := StandardMaterial3D.new()
-		fm.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
-		fm.albedo_color = Color(2.4, 2.0, 2.0)
-		m.material_overlay = fm
-	var tw := create_tween()
-	tw.tween_interval(0.09)
-	tw.tween_callback(_clear_flash)
-
-func _clear_flash() -> void:
-	for m: MeshInstance3D in _meshes:
-		if is_instance_valid(m):
-			m.material_overlay = null
-
-func _die() -> void:
-	_state = St.DYING
-	velocity = Vector3.ZERO
-	collision_layer = 0
-	collision_mask = 0
-	if _ap != null and _ap.has_animation("Skeletons_Death"):
-		_ap.play("Skeletons_Death", 0.1)
-	died.emit(global_position)
-	var tw := create_tween()
-	tw.tween_interval(1.3)
-	tw.tween_property(_model, "position:y", -1.4, 0.9)
-	tw.tween_callback(queue_free)
-
-func _on_anim_finished(anim: StringName) -> void:
-	if anim == "Skeletons_Spawn_Ground" or anim == "Skeletons_Awaken_Standing":
-		if _state == St.SPAWNING:
-			_state = St.CHASE
-	elif anim == "Hit_A" and _state == St.HURT:
-		_state = St.CHASE
-	elif anim == "Melee_1H_Attack_Chop" and _state == St.ATTACK:
-		_state = St.CHASE
-
-func _near_fire() -> bool:
-	if fire_ref == null or not fire_ref.is_lit:
-		return false
-	return global_position.distance_to(fire_ref.global_position) < Campfire.WARMTH_RADIUS
-
-func _target_pos() -> Vector3:
-	if _player != null and not _player.is_dead():
-		var dp := _player.global_position.distance_to(global_position)
-		if dp < 9.0:
-			return _player.global_position
-	if fire_ref != null:
-		return fire_ref.global_position
-	return Vector3.ZERO
+func _cache_mats(tint: Color) -> void:
+    for mi: MeshInstance3D in _rig.find_children("*", "MeshInstance3D", true, false):
+        if mi.mesh == null:
+            continue
+        for s in range(maxi(1, mi.mesh.get_surface_count())):
+            var base: Material = mi.get_active_material(s)
+            var m := (base.duplicate() if base != null else StandardMaterial3D.new()) as StandardMaterial3D
+            if m == null:
+                continue
+            m.albedo_color = m.albedo_color.lerp(tint, 0.45)
+            mi.set_surface_override_material(s, m)
+            _mats.append(m)
 
 func _physics_process(delta: float) -> void:
-	if _atk_cd > 0.0:
-		_atk_cd -= delta
+    if _dead or target == null:
+        velocity = Vector3.ZERO
+        move_and_slide()
+        return
+    _atk_timer = maxf(0.0, _atk_timer - delta)
+    if is_boss:
+        _boss_special = maxf(0.0, _boss_special - delta)
+    var to: Vector3 = target.global_position - global_position
+    to.y = 0.0
+    var dist := to.length()
+    var dir := to.normalized() if dist > 0.001 else Vector3.ZERO
+    _face(dir)
 
-	# rise-from-ground on spawn
-	if _state == St.SPAWNING:
-		_spawn_t += delta
-		_model.position.y = lerpf(-1.05, 0.0, clampf(_spawn_t / 1.2, 0.0, 1.0))
-		if _spawn_t > 1.25:
-			_state = St.CHASE
-		_apply_gravity(delta)
-		move_and_slide()
-		return
+    var want := Vector3.ZERO
+    if is_ranged and not is_boss:
+        if dist > atk_range + 2.0:
+            want = dir
+        elif dist < atk_range - 3.0:
+            want = -dir
+        else:
+            want = dir.cross(Vector3.UP) * (1.0 if int(global_position.x) % 2 == 0 else -1.0) * 0.5
+        if dist <= atk_range + 3.0 and _atk_timer <= 0.0:
+            _fire_bolt(dir)
+            _atk_timer = atk_cd
+    else:
+        if dist > atk_range * 0.85:
+            want = dir
+        elif _atk_timer <= 0.0 and _windup < 0.0:
+            _windup = 0.0
+        if is_boss and _boss_special <= 0.0 and dist < 22.0:
+            _boss_slam(dir)
+            _boss_special = 5.0
 
-	if _state == St.DYING:
-		velocity = velocity.move_toward(Vector3(0, velocity.y, 0), 12.0 * delta)
-		_apply_gravity(delta)
-		move_and_slide()
-		return
+    # melee windup -> strike
+    if _windup >= 0.0:
+        _windup += delta
+        want = Vector3.ZERO
+        if _windup >= 0.32:
+            _strike(dist, dir)
+            _windup = -1.0
+            _atk_timer = atk_cd
 
-	# fire burns the dead that get too close to the flames
-	if fire_ref != null and fire_ref.is_lit:
-		var fd := global_position.distance_to(fire_ref.global_position)
-		if fd < Campfire.SCARE_RADIUS:
-			_burn_t += delta
-			if _burn_t >= 0.5:
-				_burn_t = 0.0
-				take_hit(fire_ref.global_position, 10.0)
-				return
+    var sp := move_speed * speed_mul
+    var hv := velocity
+    hv.y = 0.0
+    hv = hv.move_toward(want * sp, 16.0 * delta)
+    velocity.x = hv.x
+    velocity.z = hv.z
+    velocity.y -= 18.0 * delta
+    move_and_slide()
+    _anim(hv.length())
 
-	var tgt := _target_pos()
-	var to := tgt - global_position
-	to.y = 0.0
-	var dist := to.length()
-	var dir := to.normalized() if dist > 0.01 else Vector3.ZERO
+func _face(dir: Vector3) -> void:
+    if _rig == null or dir.length() < 0.05:
+        return
+    var yaw := atan2(dir.x, dir.z)
+    _rig.rotation.y = lerp_angle(_rig.rotation.y, yaw, 0.18)
 
-	var speed := base_speed
-	if _near_fire():
-		speed *= 0.5
-	if _state == St.HURT:
-		_hurt_t += delta
-		speed *= 0.2
-		if _hurt_t > 0.35:
-			_state = St.CHASE
+func _anim(speed: float) -> void:
+    if _rig == null:
+        return
+    if is_ranged and not is_boss and _atk_timer > atk_cd * 0.6:
+        if _rig.current_clip != "aim":
+            _rig.aim()
+        return
+    var clip := "idle"
+    if speed > 0.5:
+        clip = "run" if speed > 2.6 else "walk"
+    if _rig.current_clip != clip:
+        _rig.play(clip)
 
-	# attack the keeper when in reach
-	if _state != St.ATTACK and _player != null and not _player.is_dead():
-		var pd := _player.global_position.distance_to(global_position)
-		if pd < 2.0 and _atk_cd <= 0.0:
-			_begin_attack()
+func _strike(dist: float, dir: Vector3) -> void:
+    if _dead or target == null:
+        return
+    if _rig != null:
+        var origin := global_position + Vector3(0, 1.1, 0) + dir * 1.0
+        _claw(origin)
+    if dist <= atk_range + 0.8 and target.has_method("take_damage"):
+        target.call("take_damage", dmg)
 
-	if _state == St.ATTACK:
-		_atk_t += delta
-		speed = 0.0
-		if not _did_strike and _atk_t >= 0.42:
-			_did_strike = true
-			_strike()
-		if _atk_t >= 1.0:
-			_state = St.CHASE
+func _fire_bolt(dir: Vector3) -> void:
+    if _rig != null and _rig.current_clip != "aim":
+        _rig.aim()
+        _rig.weapon_recoil = 1.0
+    var bolt := PlasmaBolt.new()
+    bolt.dir = dir
+    bolt.dmg = dmg
+    bolt.speed = 24.0
+    bolt.color = Color(1.0, 0.35, 0.85)
+    var parent := get_parent()
+    if parent == null:
+        return
+    parent.add_child(bolt)
+    var mz := global_position + Vector3(0, 1.4, 0) + dir * 1.2
+    if _rig != null and _rig.muzzle != null:
+        mz = _rig.muzzle.global_position
+    bolt.global_position = mz
 
-	var hv := dir * speed
-	velocity.x = move_toward(velocity.x, hv.x, 10.0 * delta)
-	velocity.z = move_toward(velocity.z, hv.z, 10.0 * delta)
-	if _knock.length() > 0.05:
-		velocity.x += _knock.x
-		velocity.z += _knock.z
-		_knock = _knock.move_toward(Vector3.ZERO, 18.0 * delta)
-	_apply_gravity(delta)
-	move_and_slide()
+func _boss_slam(dir: Vector3) -> void:
+    var parent := get_parent()
+    if parent == null:
+        return
+    for off in [-0.35, 0.0, 0.35]:
+        var bolt := PlasmaBolt.new()
+        bolt.dir = dir.rotated(Vector3.UP, off)
+        bolt.dmg = dmg * 0.6
+        bolt.speed = 18.0
+        bolt.color = Color(1.0, 0.45, 0.25)
+        parent.add_child(bolt)
+        bolt.global_position = global_position + Vector3(0, 1.6, 0) + dir * 1.5
 
-	if dir.length() > 0.05 and _state == St.CHASE:
-		var yaw := atan2(dir.x, dir.z)
-		_model.rotation.y = lerp_angle(_model.rotation.y, yaw, 9.0 * delta)
-		if _ap != null and _ap.has_animation("Skeletons_Walking") and _ap.current_animation != "Skeletons_Walking":
-			_ap.play("Skeletons_Walking", 0.15)
+func take_damage(amount: float, _at := Vector3.ZERO) -> void:
+    if _dead:
+        return
+    hp = maxf(0.0, hp - amount)
+    _flash()
+    if hp <= 0.0:
+        _die()
 
-func _begin_attack() -> void:
-	_state = St.ATTACK
-	_atk_t = 0.0
-	_did_strike = false
-	_atk_cd = 1.6
-	if _player != null:
-		var to := _player.global_position - global_position
-		to.y = 0.0
-		if to.length() > 0.1:
-			_model.rotation.y = atan2(to.x, to.z)
-	if _ap != null and _ap.has_animation("Melee_1H_Attack_Chop"):
-		_ap.play("Melee_1H_Attack_Chop", 0.08)
+func _flash() -> void:
+    var tw := create_tween()
+    tw.tween_method(_set_flash, 2.6, 0.0, 0.16)
 
-func _strike() -> void:
-	if _player == null or _player.is_dead():
-		return
-	if _player.global_position.distance_to(global_position) < 2.4:
-		_player.take_damage(damage)
+func _set_flash(v: float) -> void:
+    for m in _mats:
+        if m == null:
+            continue
+        m.emission_enabled = true
+        m.emission = Color(1.0, 0.95, 0.85)
+        m.emission_energy_multiplier = v
 
-func _apply_gravity(delta: float) -> void:
-	if not is_on_floor():
-		velocity.y -= GRAVITY * delta
-	else:
-		velocity.y = -0.5
+func _die() -> void:
+    _dead = true
+    collision_layer = 0
+    collision_mask = 0
+    if _rig != null:
+        _rig.play("death")
+    emit_signal("died", score_value, global_position)
+    var tw := create_tween()
+    tw.tween_interval(1.1)
+    tw.tween_property(self, "position:y", position.y - 2.2, 1.0)
+    tw.tween_callback(func() -> void:
+        if is_instance_valid(self): queue_free())
+
+func is_dead() -> bool:
+    return _dead
+
+func _claw(pos: Vector3) -> void:
+    var p := CPUParticles3D.new()
+    p.one_shot = true
+    p.emitting = false
+    p.amount = 12
+    p.lifetime = 0.25
+    p.explosiveness = 1.0
+    p.spread = 60.0
+    p.initial_velocity_min = 2.5
+    p.initial_velocity_max = 6.0
+    p.mesh = SphereMesh.new()
+    var m := StandardMaterial3D.new()
+    m.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+    m.albedo_color = Color(0.9, 0.3, 0.3)
+    m.emission_enabled = true
+    m.emission = Color(0.9, 0.2, 0.2)
+    m.emission_energy_multiplier = 2.5
+    p.material_override = m
+    var parent := get_parent()
+    if parent == null:
+        return
+    parent.add_child(p)
+    p.global_position = pos
+    p.emitting = true
+    get_tree().create_timer(0.5).timeout.connect(func() -> void:
+        if is_instance_valid(p): p.queue_free())
