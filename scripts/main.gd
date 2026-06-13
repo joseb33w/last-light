@@ -1,260 +1,388 @@
 extends Node3D
-## Last Light — orchestrator. Builds the world, runs the dusk->night->dawn cycle, spawns the
-## dead as night deepens, handles feeding the fire, and resolves win (survive to dawn) / loss
-## (fire goes out, or the keeper falls).
+## Outpost Vostok orchestrator: builds the station, runs the title/character-select, the
+## wave-survival loop (with the wave-8 reaver boss), the third-person collision-clamped
+## follow camera, kb+mouse and touch input routing, scoring, the quartermaster chat, and the
+## game-over + Supabase top-10 leaderboard.
 
-const SURVIVE_TIME := 150.0       # seconds from dusk to dawn
-const MAX_ENEMIES := 12
-const WOOD_PER_FEED := 1
-const FUEL_PER_WOOD := 18.0
-const FEED_RANGE := 6.0
+enum { TITLE, PLAYING, INTERMISSION, GAMEOVER }
 
+const CAM_DIST := 5.2
+const CAM_DIST_ADS := 3.4
+const SPAWN_CAP := 9
+const MOUSE_SENS := 0.0028
+const TOUCH_SENS := 0.006
+
+var _state := TITLE
 var _world: Node3D
 var _builder: WorldBuilder
-var _fire: Campfire
 var _player: Player
 var _hud: HUD
+var _npc: Quartermaster
+var _camera: Camera3D
 
-var _running := false
-var _ended := false
-var _elapsed := 0.0
-var _wood := 0
-var _kills := 0
-var _spawn_cd := 3.0
-var _phase := "Dusk"
-var _low_fire_warned := false
+var _wave := 1
+var _score := 0
+var _alive: Array = []
+var _spawn_queue: Array = []
+var _spawn_timer := 0.0
+var _boss_active := false
+
+var _cam_yaw := 0.0
+var _cam_pitch := -0.18
+var _cam_dist := CAM_DIST
+var _shake := 0.0
+var _lb_polling := false
+var _lb_deadline := 0.0
+var auto_waves := true            # tests set false to drive controlled scenarios
 var _rng := RandomNumberGenerator.new()
 
 func _ready() -> void:
-	_rng.randomize()
-	_force_expand()
+    _rng.randomize()
+    _force_expand()
+    _world = Node3D.new()
+    _world.name = "World"
+    add_child(_world)
+    _builder = WorldBuilder.new()
+    _builder.build(_world)
 
-	_world = Node3D.new()
-	_world.name = "World"
-	add_child(_world)
+    _npc = Quartermaster.new()
+    _world.add_child(_npc)
+    _npc.position = _builder.npc_point
+    _npc.range_changed.connect(_on_npc_range)
 
-	_builder = WorldBuilder.new()
-	_builder.build(_world)
+    _camera = Camera3D.new()
+    _camera.fov = 70.0
+    _camera.current = true
+    add_child(_camera)
+    _camera.global_position = Vector3(0, 6, 18)
 
-	_fire = Campfire.new()
-	_fire.name = "Campfire"
-	_world.add_child(_fire)
-	_fire.global_position = _builder.fire_point
-	_fire.went_out.connect(_on_fire_out)
+    var layer := CanvasLayer.new()
+    layer.name = "HUDLayer"
+    add_child(layer)
+    _hud = HUD.new()
+    _hud.set_persona(Quartermaster.PERSONA)
+    layer.add_child(_hud)
+    _hud.start_pressed.connect(_on_start)
+    _hud.next_wave_pressed.connect(_on_next_wave)
+    _hud.retry_pressed.connect(_on_retry)
+    _hud.interact_pressed.connect(_toggle_chat)
+    _hud.chat_close_pressed.connect(_close_chat)
+    _hud.char_selected.connect(func(c: String) -> void: G.selected_char = c)
 
-	_player = Player.new()
-	_player.name = "Player"
-	_world.add_child(_player)
-	_player.global_position = _builder.player_start
-	_player.died.connect(_on_player_died)
+    _hud.show_title()
+    _deep_link()
 
-	for p: Vector3 in _builder.pickup_points:
-		var wp := WoodPickup.new()
-		_world.add_child(wp)
-		wp.global_position = p
-		wp.collected.connect(_on_wood_collected)
+func _deep_link() -> void:
+    # allow the verifier to jump straight into gameplay: #play or #play=specter
+    if not OS.has_feature("web"):
+        return
+    var h: String = str(JavaScriptBridge.eval("location.hash || ''", true))
+    if h.begins_with("#play"):
+        var c := "soldier"
+        var parts := h.split("=")
+        if parts.size() > 1 and G.ROSTER.has(parts[1]):
+            c = parts[1]
+        call_deferred("begin_game", c)
 
-	var layer := CanvasLayer.new()
-	layer.name = "HUDLayer"
-	add_child(layer)
-	_hud = HUD.new()
-	_hud.name = "HUD"
-	layer.add_child(_hud)
-	_hud.show_start()
-
-	G.start_pressed.connect(_on_start)
-	G.restart_pressed.connect(_on_restart)
-	G.feed_pressed.connect(_on_feed)
-
-	_player.set_physics_process(false)
-	_apply_environment(0.0)
-	_update_hud()
-
-	if OS.has_feature("web"):
-		var hash_str: String = str(JavaScriptBridge.eval("window.location.hash", true))
-		if hash_str.contains("nightcheck"):
-			_elapsed = SURVIVE_TIME * 0.62
-			call_deferred("_on_start")
-		elif hash_str.contains("play"):
-			call_deferred("_on_start")
-
-func _force_expand() -> void:
-	var w := get_window()
-	w.content_scale_mode = Window.CONTENT_SCALE_MODE_CANVAS_ITEMS
-	w.content_scale_aspect = Window.CONTENT_SCALE_ASPECT_EXPAND
-
+# ════════════════════════════ STATE TRANSITIONS ════════════════════════════
 func _on_start() -> void:
-	if _running or _ended:
-		return
-	_running = true
-	_player.set_physics_process(true)
-	_hud.show_playing()
-	_hud.flash_message("Dusk falls. Keep the fire burning.")
+    begin_game(G.selected_char)
 
-func _on_restart() -> void:
-	get_tree().reload_current_scene()
+func begin_game(char_id: String) -> void:
+    if _player != null and is_instance_valid(_player):
+        _player.queue_free()
+    G.selected_char = char_id
+    _score = 0
+    _wave = 1
+    _boss_active = false
+    _clear_enemies()
+    _player = Player.new()
+    _player.add_to_group("player")
+    _player.setup(char_id)
+    _world.add_child(_player)
+    _player.global_position = _builder.player_start
+    _player.health_changed.connect(func(hp: float, mx: float) -> void: _hud.set_health(hp, mx))
+    _player.ammo_changed.connect(func(m: int, r: int) -> void: _hud.set_ammo(m, r))
+    _player.fired.connect(func(_r: float) -> void: _shake = maxf(_shake, 0.18))
+    _player.took_hit.connect(_on_player_hit)
+    _player.died.connect(_on_player_died)
+    _cam_yaw = PI
+    _cam_pitch = -0.18
+    _hud.set_char_name(char_id)
+    _hud.set_score(0)
+    _hud.show_playing()
+    _state = PLAYING
+    _capture_mouse(true)
+    _start_wave(1)
 
-func _on_feed() -> void:
-	if not _running or _ended or not _fire.is_lit:
-		return
-	if _player.global_position.distance_to(_fire.global_position) > FEED_RANGE:
-		_hud.flash_message("Get closer to the fire to feed it.")
-		return
-	if _wood <= 0:
-		_hud.flash_message("No wood! Grab the glowing piles.")
-		return
-	_wood -= WOOD_PER_FEED
-	_fire.feed(FUEL_PER_WOOD)
-	_player.play_scavenge()
-	_hud.flash_message("You feed the fire.")
-	_update_hud()
+func _start_wave(w: int) -> void:
+    _wave = w
+    _hud.set_wave(w)
+    _spawn_queue = _compose(w)
+    _spawn_timer = 0.6
+    if w % 8 == 0:
+        _boss_active = true
+        _hud.banner("WAVE %d  -  THE REAVER" % w, Color(0.95, 0.3, 0.25))
+    else:
+        _hud.banner("WAVE %d" % w, Color(1.0, 0.62, 0.25))
+    _state = PLAYING
 
-func _on_wood_collected(amount: int) -> void:
-	_wood += amount
-	_hud.flash_message("Scavenged wood  (+%d)" % amount)
-	_update_hud()
+func _compose(w: int) -> Array:
+    var list: Array = []
+    if w % 8 == 0:
+        list.append("reaver")
+        for i in (3 + int(w / 8.0)):
+            list.append("infected")
+        for i in 2:
+            list.append("cyber")
+    else:
+        var base := 3 + w
+        for i in base:
+            var r := _rng.randf()
+            if w >= 4 and r < 0.22:
+                list.append("cyber")
+            elif w >= 3 and r < 0.52:
+                list.append("alien")
+            else:
+                list.append("infected")
+    return list
 
-func _on_fire_out() -> void:
-	if _ended:
-		return
-	_end(false, "The fire went out. The dark closed in.")
+func _on_next_wave() -> void:
+    if _state != INTERMISSION:
+        return
+    _refill_player()
+    _hud.show_playing()
+    _capture_mouse(true)
+    _start_wave(_wave + 1)
+
+func _refill_player() -> void:
+    if _player == null or not is_instance_valid(_player):
+        return
+    var d: Dictionary = G.ROSTER[_player.char_id]
+    _player.mag = int(d["mag"])
+    _player.reserve = int(d["reserve"])
+    _player.emit_signal("ammo_changed", _player.mag, _player.reserve)
+
+func _on_wave_cleared() -> void:
+    if _boss_active:
+        _boss_active = false
+    _state = INTERMISSION
+    _capture_mouse(false)
+    _score += _wave * 60
+    _hud.set_score(_score)
+    _hud.show_intermission(_wave)
 
 func _on_player_died() -> void:
-	if _ended:
-		return
-	_end(false, "You fell in the dark.")
+    if _state == GAMEOVER:
+        return
+    _state = GAMEOVER
+    G.last_score = _score
+    G.last_wave = _wave
+    _capture_mouse(false)
+    _hud.show_gameover(_score, _wave)
+    _hud.set_top10([])
+    G.lb_submit(_score, _wave, _player.char_id if _player != null else "soldier")
+    await get_tree().create_timer(0.8).timeout
+    G.lb_fetch_top()
+    _lb_polling = true
+    _lb_deadline = 6.0
 
-func _on_enemy_died(_at: Vector3) -> void:
-	_kills += 1
+func _on_retry() -> void:
+    _clear_enemies()
+    if _player != null and is_instance_valid(_player):
+        _player.queue_free()
+        _player = null
+    _state = TITLE
+    _capture_mouse(false)
+    _hud.show_title()
 
-func _end(won: bool, reason: String) -> void:
-	_ended = true
-	_running = false
-	var survived := "Survived %s  -  Slain %d" % [_fmt_time(_elapsed), _kills]
-	if won:
-		_hud.show_win("You held the light for the whole night.  Slain %d" % _kills)
-	else:
-		_hud.show_over(reason)
-		_hud.set_stats(_player.health, Player.MAX_HEALTH, _fire.fuel, Campfire.MAX_FUEL, _wood, _phase, _dawn_ratio(), _kills)
+# ════════════════════════════ NPC CHAT ════════════════════════════
+func _on_npc_range(in_range: bool) -> void:
+    if _state in [PLAYING, INTERMISSION]:
+        _hud.show_talk_prompt(in_range)
 
-func _physics_process(delta: float) -> void:
-	if not _running or _ended:
-		return
-	_elapsed += delta
-	var t := clampf(_elapsed / SURVIVE_TIME, 0.0, 1.0)
-	_apply_environment(t)
-	_fire.burn_rate = lerpf(1.2, 2.3, _darkness(t))
-	_fire.tick(delta)
-	_update_phase(t)
-	_spawn_logic(delta, t)
-	_warn_low_fire()
-	_update_hud()
-	if _elapsed >= SURVIVE_TIME:
-		_end(true, "")
+func _toggle_chat() -> void:
+    if _hud.is_chat_open():
+        _close_chat()
+    elif _npc != null and _npc.in_range() and _state in [PLAYING, INTERMISSION]:
+        _open_chat()
 
-# ---------------------------------------------------------------- day/night
-func _darkness(t: float) -> float:
-	var night := smoothstep(0.0, 0.5, t)
-	var dawn := smoothstep(0.86, 1.0, t)
-	return clampf(night - dawn, 0.0, 1.0)
+func _open_chat() -> void:
+    _hud.open_chat()
+    if _player != null and is_instance_valid(_player):
+        _player.input_locked = true
+    _capture_mouse(false)
 
-func _apply_environment(t: float) -> void:
-	var d := _darkness(t)
-	var dawn := smoothstep(0.9, 1.0, t)
-	if _builder.sky_mat != null:
-		_builder.sky_mat.set_shader_parameter("blend", d)
-		_builder.sky_mat.set_shader_parameter("exposure", lerpf(1.0, 0.42, d) + dawn * 0.25)
-	if _builder.sun != null:
-		_builder.sun.light_energy = lerpf(1.2, 0.1, d) + dawn * 1.0
-		var dusk_col := Color(1.0, 0.6, 0.3)
-		var moon_col := Color(0.46, 0.58, 0.9)
-		_builder.sun.light_color = dusk_col.lerp(moon_col, d).lerp(Color(1.0, 0.7, 0.45), dawn)
-		_builder.sun.rotation.x = deg_to_rad(lerpf(-20.0, -6.0, d))
-		_builder.sun.rotation.y = deg_to_rad(lerpf(48.0, 120.0, t))
-	var env := _builder.world_env.environment
-	if env != null:
-		env.ambient_light_energy = lerpf(0.85, 0.2, d) + dawn * 0.2
-		env.fog_density = lerpf(0.015, 0.032, d)
-		env.fog_light_color = Color(0.42, 0.36, 0.32).lerp(Color(0.13, 0.17, 0.27), d)
+func _close_chat() -> void:
+    _hud.close_chat()
+    if _player != null and is_instance_valid(_player):
+        _player.input_locked = false
+    if _state == PLAYING:
+        _capture_mouse(true)
 
-func _dawn_ratio() -> float:
-	return clampf(_elapsed / SURVIVE_TIME, 0.0, 1.0)
+# ════════════════════════════ INPUT ════════════════════════════
+func _input(event: InputEvent) -> void:
+    if event is InputEventMouseMotion and _state == PLAYING and Input.mouse_mode == Input.MOUSE_MODE_CAPTURED:
+        var mm := event as InputEventMouseMotion
+        _cam_yaw -= mm.relative.x * MOUSE_SENS
+        _cam_pitch = clampf(_cam_pitch - mm.relative.y * MOUSE_SENS, -1.2, 0.55)
+    elif event is InputEventKey:
+        var k := event as InputEventKey
+        if k.pressed and k.physical_keycode == KEY_ESCAPE:
+            if _hud.is_chat_open():
+                _close_chat()
+            elif _state == PLAYING:
+                _capture_mouse(false)
+    if event.is_action_pressed("interact") and _state in [PLAYING, INTERMISSION]:
+        _toggle_chat()
 
-func _update_phase(t: float) -> void:
-	var p := "Dusk"
-	if t >= 0.97:
-		p = "Dawn"
-	elif t >= 0.85:
-		p = "Before Dawn"
-	elif t >= 0.5:
-		p = "Deep Night"
-	elif t >= 0.16:
-		p = "Nightfall"
-	if p != _phase:
-		_phase = p
-		match p:
-			"Nightfall": _hud.flash_message("Night falls. They are coming.")
-			"Deep Night": _hud.flash_message("Deep night. Keep the flames high.")
-			"Before Dawn": _hud.flash_message("Dawn is near. Hold the light!")
-			"Dawn": _hud.flash_message("The sky is lightening...")
+func _capture_mouse(on: bool) -> void:
+    if DisplayServer.is_touchscreen_available():
+        return
+    Input.mouse_mode = Input.MOUSE_MODE_CAPTURED if on else Input.MOUSE_MODE_VISIBLE
 
-# ---------------------------------------------------------------- spawning
-func _spawn_logic(delta: float, t: float) -> void:
-	var d := _darkness(t)
-	if d < 0.12:
-		return
-	_spawn_cd -= delta
-	if _spawn_cd > 0.0:
-		return
-	_spawn_cd = lerpf(4.2, 1.1, d)
-	var alive := get_tree().get_nodes_in_group("enemies").size()
-	if alive >= MAX_ENEMIES:
-		return
-	_spawn_enemy(d)
+# ════════════════════════════ FRAME LOOP ════════════════════════════
+func _process(delta: float) -> void:
+    _update_camera(delta)
+    _poll_leaderboard(delta)
+    if _npc != null:
+        _npc.idle_pose()
+    if _state != PLAYING:
+        if _player != null and is_instance_valid(_player) and _state == INTERMISSION:
+            _feed_input()
+        return
+    _feed_input()
+    _update_waves(delta)
 
-func _spawn_enemy(d: float) -> void:
-	if _builder.spawn_points.is_empty():
-		return
-	var origin := _player.global_position
-	# prefer a spawn point away from the player so they emerge from the dark fringe
-	var pts := _builder.spawn_points
-	var best := pts[_rng.randi() % pts.size()]
-	for i in range(3):
-		var cand: Vector3 = pts[_rng.randi() % pts.size()]
-		if cand.distance_to(origin) > best.distance_to(origin):
-			best = cand
-	var e := Enemy.new()
-	if d > 0.55 and _rng.randf() < 0.35:
-		e.variant = "warrior"
-		e.max_health = 120.0
-		e.damage = 16.0
-		e.base_speed = 2.0
-		e.tint = Color(0.86, 0.84, 0.8)
-	else:
-		e.variant = "minion"
-		e.max_health = 56.0
-		e.damage = 11.0
-		e.base_speed = 2.5
-		e.tint = Color(0.78, 0.82, 0.78).lerp(Color(0.6, 0.7, 0.6), _rng.randf())
-	e.fire_ref = _fire
-	_world.add_child(e)
-	var jitter := Vector3(_rng.randf_range(-1.5, 1.5), 0, _rng.randf_range(-1.5, 1.5))
-	e.global_position = best + jitter
-	e.died.connect(_on_enemy_died)
+func _feed_input() -> void:
+    if _player == null or not is_instance_valid(_player):
+        return
+    _player.touch_move = _hud.move_vector
+    _player.touch_fire = _hud.fire_held
+    _player.touch_aim = _hud.aim_held
+    var ld := _hud.consume_look()
+    if ld != Vector2.ZERO:
+        _cam_yaw -= ld.x * TOUCH_SENS
+        _cam_pitch = clampf(_cam_pitch - ld.y * TOUCH_SENS, -1.2, 0.55)
 
-# ---------------------------------------------------------------- hud / misc
-func _warn_low_fire() -> void:
-	if _fire.fuel_ratio() < 0.22 and _fire.is_lit:
-		if not _low_fire_warned:
-			_low_fire_warned = true
-			_hud.flash_message("The fire is dying! Feed it!")
-	else:
-		_low_fire_warned = false
+func _update_camera(delta: float) -> void:
+    if _player == null or not is_instance_valid(_player):
+        return
+    var aiming := _hud.aim_held or _hud.fire_held or Input.is_action_pressed("aim") or Input.is_action_pressed("fire")
+    var target_dist := CAM_DIST_ADS if aiming else CAM_DIST
+    _cam_dist = lerpf(_cam_dist, target_dist, 8.0 * delta)
+    _camera.fov = lerpf(_camera.fov, 55.0 if aiming else 70.0, 8.0 * delta)
+    var look := Basis.from_euler(Vector3(_cam_pitch, _cam_yaw, 0))
+    var forward := -look.z
+    var pivot := _player.global_position + Vector3(0, 1.65, 0) + look.x * 0.5
+    var desired := pivot - forward * _cam_dist
+    # collision clamp against world
+    var space := get_world_3d().direct_space_state
+    var q := PhysicsRayQueryParameters3D.create(pivot, desired)
+    q.collision_mask = 1
+    var hit := space.intersect_ray(q)
+    if not hit.is_empty():
+        desired = (hit["position"] as Vector3) + forward * 0.3
+    if _shake > 0.001:
+        _shake = maxf(0.0, _shake - delta * 1.2)
+        desired += Vector3(_rng.randf_range(-1, 1), _rng.randf_range(-1, 1), _rng.randf_range(-1, 1)) * _shake * 0.25
+    _camera.global_position = _camera.global_position.lerp(desired, clampf(18.0 * delta, 0.0, 1.0))
+    _camera.look_at(pivot + forward * 3.0, Vector3.UP)
 
-func _update_hud() -> void:
-	_hud.set_stats(_player.health, Player.MAX_HEALTH, _fire.fuel, Campfire.MAX_FUEL,
-		_wood, _phase, _dawn_ratio(), _kills)
+func _update_waves(delta: float) -> void:
+    if not auto_waves:
+        return
+    var mul := minf(1.0 + 0.03 * _wave, 1.45)
+    if not _spawn_queue.is_empty():
+        _spawn_timer -= delta
+        if _spawn_timer <= 0.0 and _alive.size() < SPAWN_CAP:
+            var kind: String = _spawn_queue.pop_front()
+            _spawn_enemy(kind, mul)
+            _spawn_timer = 0.7 if kind != "reaver" else 0.0
+    elif _alive.is_empty():
+        _on_wave_cleared()
 
-func _fmt_time(secs: float) -> String:
-	var s := int(secs)
-	return "%d:%02d" % [s / 60, s % 60]
+func _spawn_enemy(kind: String, mul: float) -> void:
+    var e := Enemy.new()
+    e.setup(kind)
+    e.speed_mul = mul
+    e.target = _player
+    _world.add_child(e)
+    var pts := _builder.spawn_points
+    var p: Vector3 = pts[_rng.randi() % pts.size()] if pts.size() > 0 else Vector3(0, 0.1, -18)
+    if kind == "reaver":
+        p = Vector3(0, 0.1, -19)
+    e.global_position = p
+    e.died.connect(_on_enemy_died)
+    _alive.append(e)
+
+func _on_enemy_died(value: int, at: Vector3) -> void:
+    _score += value
+    _hud.set_score(_score)
+    for i in range(_alive.size() - 1, -1, -1):
+        if not is_instance_valid(_alive[i]) or (_alive[i] as Enemy).is_dead():
+            _alive.remove_at(i)
+
+func _clear_enemies() -> void:
+    for e in _alive:
+        if is_instance_valid(e):
+            e.queue_free()
+    _alive.clear()
+    _spawn_queue.clear()
+
+func _on_player_hit() -> void:
+    _hud.flash_damage()
+    _shake = maxf(_shake, 0.35)
+
+func _poll_leaderboard(delta: float) -> void:
+    if not _lb_polling:
+        return
+    _lb_deadline -= delta
+    var st := G.lb_top_state()
+    if st != "" and st != "pending" and st != "error" and st != "nonweb":
+        _hud.set_top10(G.lb_parse_top(st))
+        _lb_polling = false
+    elif _lb_deadline <= 0.0:
+        _lb_polling = false
+
+func _force_expand() -> void:
+    var w := get_window()
+    w.content_scale_mode = Window.CONTENT_SCALE_MODE_CANVAS_ITEMS
+    w.content_scale_aspect = Window.CONTENT_SCALE_ASPECT_EXPAND
+
+# ════════════════════════════ TEST HOOKS ════════════════════════════
+func get_player() -> Player:
+    return _player
+
+func get_hud() -> HUD:
+    return _hud
+
+func get_world() -> Node3D:
+    return _world
+
+func get_npc() -> Quartermaster:
+    return _npc
+
+func get_camera() -> Camera3D:
+    return _camera
+
+func get_environment_sky_material() -> Material:
+    for c in _world.get_children():
+        if c is WorldEnvironment:
+            var env := (c as WorldEnvironment).environment
+            if env != null and env.sky != null:
+                return env.sky.sky_material
+    return null
+
+func spawn_test_enemy(kind: String, pos: Vector3) -> Enemy:
+    var e := Enemy.new()
+    e.setup(kind)
+    e.target = _player
+    _world.add_child(e)
+    e.global_position = pos
+    e.died.connect(_on_enemy_died)
+    _alive.append(e)
+    return e
+
+func alive_count() -> int:
+    return _alive.size()
